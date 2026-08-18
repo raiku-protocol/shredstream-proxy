@@ -1,48 +1,31 @@
 use std::{
-    collections::HashMap,
     io,
     io::{Error, ErrorKind},
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     panic,
-    path::{Path, PathBuf},
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
     thread,
-    thread::{sleep, spawn, JoinHandle},
+    thread::{sleep, spawn},
     time::Duration,
 };
 
 use arc_swap::ArcSwap;
-use clap::{arg, Parser};
+use clap::Parser;
 use crossbeam_channel::{Receiver, RecvError, Sender};
 use log::*;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use solana_client::client_error::{reqwest, ClientError};
-use solana_ledger::shred::Shred;
 use solana_metrics::set_host_id;
 use solana_perf::deduper::Deduper;
-use solana_sdk::{clock::Slot, signature::read_keypair_file};
 use solana_streamer::streamer::StreamerReceiveStats;
 use thiserror::Error;
-use tokio::{runtime::Runtime, sync::broadcast::Sender as BroadcastSender};
-use tonic::Status;
 
-use crate::{
-    forwarder::ShredMetrics, multicast_config::create_multicast_socket_on_device,
-    token_authenticator::BlockEngineConnectionError,
-};
-mod deshred;
+use crate::{forwarder::ShredMetrics, multicast_config::create_multicast_socket_on_device};
 pub mod forwarder;
-mod heartbeat;
 mod multicast_config;
-mod server;
-mod token_authenticator;
-
-const SHREDSTREAM_SHUTDOWN_DATE: &str = "September 5, 2026";
-const SHREDSTREAM_SHUTDOWN_UNIX_SECONDS: u64 = 1_788_566_400;
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -54,44 +37,17 @@ struct Args {
 
 #[derive(Clone, Debug, clap::Subcommand)]
 enum ProxySubcommands {
-    /// Requests shreds from Jito and sends to all destinations.
-    Shredstream(ShredstreamArgs),
-
-    /// Does not request shreds from Jito. Sends anything received on `src-bind-addr`:`src-bind-port` to all destinations.
+    /// Sends anything received on `src-bind-addr`:`src-bind-port` to all destinations.
     ForwardOnly(CommonArgs),
 }
 
 #[derive(clap::Args, Clone, Debug)]
-struct ShredstreamArgs {
-    /// Address for Jito Block Engine.
-    /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
-    #[arg(long, env)]
-    block_engine_url: String,
-
-    /// Manual override for auth service address. For internal use.
-    #[arg(long, env)]
-    auth_url: Option<String>,
-
-    /// Path to keypair file used to authenticate with the backend.
-    #[arg(long, env)]
-    auth_keypair: PathBuf,
-
-    /// Desired regions to receive heartbeats from.
-    /// Receives `n` different streams. Requires at least 1 region, comma separated.
-    #[arg(long, env, value_delimiter = ',', required(true))]
-    desired_regions: Vec<String>,
-
-    #[clap(flatten)]
-    common_args: CommonArgs,
-}
-
-#[derive(clap::Args, Clone, Debug)]
 struct CommonArgs {
-    /// Address where Shredstream proxy listens.
+    /// Address where the proxy listens.
     #[arg(long, env, default_value_t = IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))]
     src_bind_addr: IpAddr,
 
-    /// Port where Shredstream proxy listens. Use `0` for random ephemeral port.
+    /// Port where the proxy listens. Use `0` for random ephemeral port.
     #[arg(long, env, default_value_t = 20_000)]
     src_bind_port: u16,
 
@@ -110,20 +66,19 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = 20001)]
     multicast_subscribe_port: u16,
 
-    /// Static set of IP:Port where Shredstream proxy forwards shreds to, comma separated.
+    /// Static set of IP:Port where the proxy forwards shreds to, comma separated.
     /// Eg. `127.0.0.1:8001,10.0.0.1:8001`.
     // Note: store the original string, so we can do hostname resolution when refreshing destinations
     #[arg(long, env, value_delimiter = ',', value_parser = resolve_hostname_port)]
     dest_ip_ports: Vec<(SocketAddr, String)>,
 
-    /// Http JSON endpoint to dynamically get IPs for Shredstream proxy to forward shreds.
+    /// Http JSON endpoint to dynamically get IPs for the proxy to forward shreds.
     /// Endpoints are then set-union with `dest-ip-ports`.
     #[arg(long, env)]
     endpoint_discovery_url: Option<String>,
 
     /// Port to send shreds to for hosts fetched via `endpoint-discovery-url`.
     /// Port can be found using `scripts/get_tvu_port.sh`.
-    /// See https://jito-labs.gitbook.io/mev/searcher-services/shredstream#running-shredstream
     #[arg(long, env)]
     discovered_endpoints_port: Option<u16>,
 
@@ -135,15 +90,6 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = false)]
     debug_trace_shred: bool,
 
-    /// GRPC port for serving decoded shreds as Solana entries
-    #[arg(long, env)]
-    grpc_service_port: Option<u16>,
-
-    /// Public IP address to use.
-    /// Overrides value fetched from `ifconfig.me`.
-    #[arg(long, env)]
-    public_ip: Option<IpAddr>,
-
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
@@ -151,24 +97,16 @@ struct CommonArgs {
 
 #[derive(Debug, Error)]
 pub enum ShredstreamProxyError {
-    #[error("TonicError {0}")]
-    TonicError(#[from] tonic::transport::Error),
-    #[error("GrpcError {0}")]
-    GrpcError(#[from] Status),
     #[error("ReqwestError {0}")]
     ReqwestError(#[from] reqwest::Error),
     #[error("SerdeJsonError {0}")]
     SerdeJsonError(#[from] serde_json::Error),
     #[error("RpcError {0}")]
     RpcError(#[from] ClientError),
-    #[error("BlockEngineConnectionError {0}")]
-    BlockEngineConnectionError(#[from] BlockEngineConnectionError),
     #[error("RecvError {0}")]
     RecvError(#[from] RecvError),
     #[error("IoError {0}")]
     IoError(#[from] io::Error),
-    #[error("Shutdown")]
-    Shutdown,
 }
 
 fn resolve_hostname_port(hostname_port: &str) -> io::Result<(SocketAddr, String)> {
@@ -180,26 +118,6 @@ fn resolve_hostname_port(hostname_port: &str) -> io::Result<(SocketAddr, String)
     })?;
 
     Ok((socketaddr, hostname_port.to_string()))
-}
-
-/// Returns public-facing IPV4 address
-pub fn get_public_ip() -> reqwest::Result<IpAddr> {
-    info!("Requesting public ip from ifconfig.me...");
-    let client = reqwest::blocking::Client::builder()
-        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        .build()?;
-    let response = client.get("https://ifconfig.me/ip").send()?.text()?;
-    let public_ip = IpAddr::from_str(&response).unwrap();
-    info!("Retrieved public ip: {public_ip:?}");
-
-    Ok(public_ip)
-}
-
-fn shutdown_has_passed() -> bool {
-    std::time::UNIX_EPOCH
-        .elapsed()
-        .map(|elapsed| elapsed.as_secs() >= SHREDSTREAM_SHUTDOWN_UNIX_SECONDS)
-        .unwrap_or(false)
 }
 
 // Creates a channel that gets a message every time `SIGINT` is signalled.
@@ -224,31 +142,13 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
     Ok((s, r))
 }
 
-pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
     env_logger::builder().init();
 
     let all_args: Args = Args::parse();
 
-    let shredstream_args = all_args.shredstream_args.clone();
-    if matches!(&shredstream_args, ProxySubcommands::Shredstream(_)) {
-        eprintln!(
-            "\n\
-Jito ShredStream is deprecated and will shut down on {SHREDSTREAM_SHUTDOWN_DATE}.\n\
-Migrate to DoubleZero Edge: https://doublezero.xyz/jito-shredstream\n\
-Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
-        );
-        if shutdown_has_passed() {
-            warn!("ShredStream has been shut down on {SHREDSTREAM_SHUTDOWN_DATE}");
-            return Err(ShredstreamProxyError::Shutdown);
-        }
-    }
-
     // common args
-    let args = match all_args.shredstream_args {
-        ProxySubcommands::Shredstream(x) => x.common_args,
-        ProxySubcommands::ForwardOnly(x) => x,
-    };
+    let ProxySubcommands::ForwardOnly(args) = all_args.shredstream_args;
     set_host_id(hostname::get()?.into_string().unwrap());
     if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
         || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
@@ -278,21 +178,9 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
         }));
     }
 
-    let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    let metrics = Arc::new(ShredMetrics::new());
 
-    let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
-    if let ProxySubcommands::Shredstream(args) = shredstream_args {
-        if args.desired_regions.len() > 2 {
-            warn!(
-                "Too many regions requested, only regions: {:?} will be used",
-                &args.desired_regions[..2]
-            );
-        }
-        let heartbeat_hdl =
-            start_heartbeat(args, &exit, &shutdown_receiver, runtime, metrics.clone());
-        thread_handles.push(heartbeat_hdl);
-    }
 
     // share sockets between refresh and forwarder thread
     let unioned_dest_sockets = Arc::new(ArcSwap::from_pointee(
@@ -309,7 +197,6 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
         forwarder::DEDUPER_NUM_BITS,
     )));
 
-    let entry_sender = Arc::new(BroadcastSender::new(100));
     let forward_stats = Arc::new(StreamerReceiveStats::new("shredstream_proxy-listen_thread"));
     let use_discovery_service =
         args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_some();
@@ -326,8 +213,6 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
         maybe_multicast_socket,
         args.num_threads,
         deduper.clone(),
-        args.grpc_service_port.is_some(),
-        entry_sender.clone(),
         args.debug_trace_shred,
         use_discovery_service,
         forward_stats.clone(),
@@ -368,18 +253,8 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
         thread_handles.push(refresh_handle);
     }
 
-    if let Some(port) = args.grpc_service_port {
-        let server_hdl = server::start_server_thread(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            entry_sender.clone(),
-            exit.clone(),
-            shutdown_receiver.clone(),
-        );
-        thread_handles.push(server_hdl);
-    }
-
     info!(
-        "Shredstream started, listening on {}:{}/udp.",
+        "Shred forwarder started, listening on {}:{}/udp.",
         args.src_bind_addr, args.src_bind_port
     );
 
@@ -388,7 +263,7 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
     }
 
     info!(
-        "Exiting Shredstream, {} received , {} sent successfully, {} failed, {} duplicate shreds.",
+        "Exiting shred forwarder, {} received , {} sent successfully, {} failed, {} duplicate shreds.",
         metrics.agg_received_cumulative.load(Ordering::Relaxed),
         metrics
             .agg_success_forward_cumulative
@@ -397,39 +272,4 @@ Support: https://discord.com/invite/doublezerotech (#jito-shredstream)\n"
         metrics.duplicate_cumulative.load(Ordering::Relaxed),
     );
     Ok(())
-}
-
-fn start_heartbeat(
-    args: ShredstreamArgs,
-    exit: &Arc<AtomicBool>,
-    shutdown_receiver: &Receiver<()>,
-    runtime: Runtime,
-    metrics: Arc<ShredMetrics>,
-) -> JoinHandle<()> {
-    let auth_keypair = Arc::new(
-        read_keypair_file(Path::new(&args.auth_keypair)).unwrap_or_else(|e| {
-            panic!(
-                "Unable to parse keypair file. Ensure that file {:?} is readable. Error: {e}",
-                args.auth_keypair
-            )
-        }),
-    );
-
-    heartbeat::heartbeat_loop_thread(
-        args.block_engine_url.clone(),
-        args.auth_url.unwrap_or(args.block_engine_url),
-        auth_keypair,
-        args.desired_regions,
-        SocketAddr::new(
-            args.common_args
-                .public_ip
-                .unwrap_or_else(|| get_public_ip().unwrap()),
-            args.common_args.src_bind_port,
-        ),
-        runtime,
-        "shredstream_proxy".to_string(),
-        metrics,
-        shutdown_receiver.clone(),
-        exit.clone(),
-    )
 }

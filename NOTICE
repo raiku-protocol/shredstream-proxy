@@ -1,0 +1,29 @@
+Raiku Shredstream Proxy
+Copyright 2026 Raiku
+
+This product includes software developed at Jito Labs, Inc.
+(https://jito.wtf/).
+
+This work is a derivative of jito-labs/shredstream-proxy
+(https://github.com/jito-labs/shredstream-proxy), forked at commit
+b96e369f3165600c02182e3d8e1d01b6aada9fdb (tag v0.2.14), licensed under the
+Apache License, Version 2.0.
+
+Modifications made by Raiku:
+
+  * Removed the ShredStream deprecation kill switch (the hard-coded
+    September 5, 2026 shutdown date, the `shutdown_has_passed()` check and the
+    associated startup abort) introduced upstream in commit b96e369.
+  * Trimmed the program to forward-only operation. Removed the `shredstream`
+    subcommand, the Jito Block Engine heartbeat client, the Ed25519 token
+    authenticator, the shred reconstruction (deshred) pipeline and the gRPC
+    entry-streaming server, along with their command-line flags and metrics.
+  * Renamed the crate and binary from `jito-shredstream-proxy` to
+    `raiku-shredstream-proxy`, and the `jito-protos` crate to
+    `raiku-shred-protos`.
+  * Replaced the `jito_protos/protos` git submodule (jito-labs/mev-protos) with
+    a vendored, reduced `shredstream.proto` containing only the `TraceShred`
+    message.
+  * Removed the `solana-ledger` dependency on the jito-foundation/jito-solana
+    branch `eric/v2.2-merkle-recovery`; all Solana crates now resolve from
+    crates.io.
