@@ -5,13 +5,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04-16c-64g-public
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          lfs: true
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust

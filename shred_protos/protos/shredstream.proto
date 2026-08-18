@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package shredstream;
+
+import "google/protobuf/timestamp.proto";
+
+// Diagnostic shred emitted by upstream shred senders, used to measure end-to-end
+// latency when `--debug-trace-shred` is enabled. Trace shreds are counted and
+// timed, then forwarded like any other packet.
+message TraceShred {
+  // source region of the sender
+  string region = 1;
+  // timestamp of creation
+  google.protobuf.Timestamp created_at = 2;
+  // monotonically increases, resets upon service restart
+  uint32 seq_num = 3;
+}

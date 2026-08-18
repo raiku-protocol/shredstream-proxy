@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,11 +12,10 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvError};
 use dashmap::DashMap;
 use itertools::Itertools;
-use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
+use raiku_shred_protos::shredstream::TraceShred;
 use log::{debug, error, info, warn};
 use prost::Message;
 use solana_client::client_error::reqwest;
-use solana_ledger::shred::ReedSolomonCache;
 use solana_metrics::{datapoint_info, datapoint_warn};
 use solana_net_utils::SocketConfig;
 use solana_perf::{
@@ -25,18 +23,12 @@ use solana_perf::{
     packet::{PacketBatch, PacketBatchRecycler},
     recycler::Recycler,
 };
-use solana_sdk::clock::Slot;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
     streamer::{self, StreamerReceiveStats},
 };
-use tokio::sync::broadcast::Sender;
 
-use crate::{
-    deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
-    resolve_hostname_port, ShredstreamProxyError,
-};
+use crate::{resolve_hostname_port, ShredstreamProxyError};
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
 pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
@@ -52,8 +44,6 @@ pub fn start_forwarder_threads(
     maybe_multicast_socket: Option<Vec<UdpSocket>>,
     num_threads: Option<usize>,
     deduper: Arc<RwLock<Deduper<2, [u8]>>>,
-    should_reconstruct_shreds: bool,
-    entry_sender: Arc<Sender<PbEntry>>,
     debug_trace_shred: bool,
     use_discovery_service: bool,
     forward_stats: Arc<StreamerReceiveStats>,
@@ -77,59 +67,6 @@ pub fn start_forwarder_threads(
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
 
-    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
-    let mut thread_hdls = Vec::with_capacity(num_threads + 1);
-
-    if should_reconstruct_shreds {
-        let metrics = metrics.clone();
-        let exit = exit.clone();
-        // receives shreds from recv_from_channel_and_send_multiple_dest and calls deshred::reconstruct_shreds
-        let hdl = std::thread::Builder::new()
-            .name("shred_reconstructor".to_string())
-            .spawn(move || {
-                let mut all_shreds = ahash::HashMap::<
-                    Slot,
-                    (
-                        ahash::HashMap<u32, HashSet<ComparableShred>>,
-                        ShredsStateTracker,
-                    ),
-                >::default();
-                let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
-                    Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
-                let mut highest_slot_seen: Slot = 0;
-                let rs_cache = ReedSolomonCache::default();
-
-                while !exit.load(Ordering::Relaxed) {
-                    match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
-                                pkt_batch,
-                                &mut all_shreds,
-                                &mut slot_fec_indexes_to_iterate,
-                                &mut deshredded_entries,
-                                &mut highest_slot_seen,
-                                &rs_cache,
-                                &metrics,
-                            );
-
-                            deshredded_entries.drain(..).for_each(
-                                |(slot, _entries, entries_bytes)| {
-                                    let _ = entry_sender.send(PbEntry {
-                                        slot,
-                                        entries: entries_bytes,
-                                    });
-                                },
-                            );
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            })
-            .unwrap();
-        thread_hdls.push(hdl);
-    };
 
     sockets
         .into_iter()
@@ -154,7 +91,6 @@ pub fn start_forwarder_threads(
             let unioned_dest_sockets = unioned_dest_sockets.clone();
             let metrics = metrics.clone();
             let shutdown_receiver = shutdown_receiver.clone();
-            let reconstruct_tx = reconstruct_tx.clone();
             let exit = exit.clone();
 
             let send_thread = Builder::new()
@@ -180,8 +116,6 @@ pub fn start_forwarder_threads(
                                     &deduper,
                                     &send_socket,
                                     &local_dest_sockets,
-                                    should_reconstruct_shreds,
-                                    &reconstruct_tx,
                                     debug_trace_shred,
                                     &metrics,
                                 );
@@ -220,8 +154,6 @@ fn recv_from_channel_and_send_multiple_dest(
     deduper: &RwLock<Deduper<2, [u8]>>,
     send_socket: &UdpSocket,
     local_dest_sockets: &[SocketAddr],
-    should_reconstruct_shreds: bool,
-    reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
 ) -> Result<(), ShredstreamProxyError> {
@@ -235,10 +167,6 @@ fn recv_from_channel_and_send_multiple_dest(
         packet_batch.len(),
         packet_batch.iter().map(|x| x.meta().size).sum::<usize>()
     );
-
-    if should_reconstruct_shreds {
-        let _ = reconstruct_tx.try_send(packet_batch.clone());
-    }
 
     let mut packet_batch_vec = vec![packet_batch];
 
@@ -464,23 +392,6 @@ pub struct ShredMetrics {
     /// (discarded, not discarded, from other shredstream instances)
     pub packets_received: DashMap<IpAddr, (u64, u64)>,
 
-    // service metrics
-    pub enabled_grpc_service: bool,
-    /// Number of data shreds recovered using coding shreds
-    pub recovered_count: AtomicU64,
-    /// Number of Solana entries decoded from shreds
-    pub entry_count: AtomicU64,
-    /// Number of transactions decoded from shreds
-    pub txn_count: AtomicU64,
-    /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag
-    pub unknown_start_position_count: AtomicU64,
-    /// Number of FEC recovery errors
-    pub fec_recovery_error_count: AtomicU64,
-    /// Number of bincode Entry deserialization errors
-    pub bincode_deserialize_error_count: AtomicU64,
-    /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
-    pub unknown_start_position_error_count: AtomicU64,
-
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
     pub agg_success_forward_cumulative: AtomicU64,
@@ -490,26 +401,18 @@ pub struct ShredMetrics {
 
 impl Default for ShredMetrics {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
 impl ShredMetrics {
-    pub fn new(enabled_grpc_service: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            enabled_grpc_service,
             received: Default::default(),
             success_forward: Default::default(),
             fail_forward: Default::default(),
             duplicate: Default::default(),
             packets_received: DashMap::with_capacity(10),
-            recovered_count: Default::default(),
-            entry_count: Default::default(),
-            txn_count: Default::default(),
-            unknown_start_position_count: Default::default(),
-            fec_recovery_error_count: Default::default(),
-            bincode_deserialize_error_count: Default::default(),
-            unknown_start_position_error_count: Default::default(),
             agg_received_cumulative: Default::default(),
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
@@ -533,45 +436,6 @@ impl ShredMetrics {
             ),
             ("duplicate", self.duplicate.load(Ordering::Relaxed), i64),
         );
-
-        if self.enabled_grpc_service {
-            datapoint_info!(
-                "shredstream_proxy-service_metrics",
-                (
-                    "recovered_count",
-                    self.recovered_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "entry_count",
-                    self.entry_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                ("txn_count", self.txn_count.swap(0, Ordering::Relaxed), i64),
-                (
-                    "unknown_start_position_count",
-                    self.unknown_start_position_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "fec_recovery_error_count",
-                    self.fec_recovery_error_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "bincode_deserialize_error_count",
-                    self.bincode_deserialize_error_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "unknown_start_position_error_count",
-                    self.unknown_start_position_error_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-            );
-        }
 
         self.packets_received
             .retain(|addr, (discarded_packets, not_discarded_packets)| {
@@ -653,10 +517,12 @@ mod tests {
         let (packet_sender, packet_receiver) = crossbeam_channel::unbounded::<PacketBatch>();
         packet_sender.send(packet_batch).unwrap();
 
+        // bind/send on loopback explicitly: 0.0.0.0 is a valid bind address but not a
+        // routable destination on macOS (EHOSTUNREACH), which made this test linux-only.
         let dest_socketaddrs = vec![
-            SocketAddr::from_str("0.0.0.0:32881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:33881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:34881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:32881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:33881").unwrap(),
+            SocketAddr::from_str("127.0.0.1:34881").unwrap(),
         ];
 
         let test_listeners = dest_socketaddrs
@@ -671,7 +537,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let udp_sender = UdpSocket::bind("0.0.0.0:10000").unwrap();
+        let udp_sender = UdpSocket::bind("127.0.0.1:10000").unwrap();
 
         // spawn listeners
         test_listeners
@@ -682,7 +548,6 @@ mod tests {
                 thread::spawn(move || listen_and_collect(socket, to_receive));
             });
 
-        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
         // send packets
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
@@ -692,8 +557,6 @@ mod tests {
             ))),
             &udp_sender,
             &Arc::new(dest_socketaddrs),
-            true,
-            &reconstruct_tx,
             false,
             &Arc::new(ShredMetrics::default()),
         )
